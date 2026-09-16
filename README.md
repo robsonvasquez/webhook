@@ -10,6 +10,12 @@ imagens, quando o dispositivo envia.
 Não decide nada nem aciona nada de volta no dispositivo: é só um listener
 de observação/depuração.
 
+Abrindo a URL raiz (`/`) do serviço num navegador, você vê os eventos
+chegando **ao vivo**, sem precisar dar refresh — não precisa entrar no
+dashboard do Render pra acompanhar. Configure o dispositivo pra mandar os
+eventos pra qualquer outro path (`/evento`, por exemplo) — `/`, `/stream` e
+`/events.json` são reservados para essa visualização.
+
 ## Rodando localmente
 
 ```bash
@@ -36,8 +42,11 @@ python event_listener.py 9000       # porta customizada
    o caminho exato varia por modelo):
    - **IP/Domínio**: `event-listener.onrender.com`
    - **Porta**: `443` (HTTPS) — o Render já termina TLS por você
-   - **URL anfitrião**: `/evento` (ou qualquer caminho — o servidor aceita
-     POST/GET em qualquer path)
+   - **URL anfitrião**: `/evento` (ou qualquer caminho, exceto `/`, `/stream`
+     e `/events.json`, reservados para a visualização ao vivo)
+4. Pra acompanhar em tempo real, abra `https://event-listener.onrender.com/`
+   no navegador — cada evento aparece formatado assim que chega, sem
+   precisar dar refresh nem entrar no dashboard do Render.
 
 ### Observações importantes
 
