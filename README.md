@@ -1,62 +1,44 @@
-# hik_lpr_listener
+# event_listener
 
-Servidor HTTP (stdlib, sem dependências) que recebe os eventos ANPR/LPR
-enviados por câmeras Hikvision via ISAPI Listening, loga tudo e opcionalmente
-repassa cada evento para um backend e/ou aciona a barreira/cancela.
+Servidor HTTP (stdlib, sem dependências) pra inspecionar os eventos que
+dispositivos Hikvision (câmeras LPR/ANPR, terminais de reconhecimento
+facial, controladoras de acesso, etc.) enviam via ISAPI Listening. Cadastre
+a URL deste servidor no dispositivo e veja no terminal (e em `recebidos/`)
+como cada tipo de evento chega — headers, corpo, XML achatado em JSON e
+imagens, quando o dispositivo envia.
+
+Não decide nada nem aciona nada de volta no dispositivo: é só um listener
+de observação/depuração.
 
 ## Rodando localmente
 
 ```bash
-python hik_lpr_listener.py            # porta 8000
-python hik_lpr_listener.py 9000       # porta customizada
+python event_listener.py            # porta 8000
+python event_listener.py 9000       # porta customizada
 ```
-
-Configuração via variáveis de ambiente — veja `.env.example`. Nenhum dado
-sensível (senha da câmera, IP) fica no código.
 
 ## Deploy no Render
 
 1. **Suba este repositório para o GitHub** (já feito se você seguiu o fluxo
    assistido; senão: `git init && git add . && git commit -m "..." && gh repo create`).
 2. No [dashboard do Render](https://dashboard.render.com), clique em
-   **New + → Blueprint** e aponte para este repositório — ele vai ler o
-   `render.yaml` e criar o Web Service `hik-lpr-listener` automaticamente
-   (build/start command já configurados).
+   **New + → Blueprint** e aponte para este repositório — ele lê o
+   `render.yaml` e cria o Web Service `event-listener` automaticamente.
    - Alternativa manual (sem blueprint): **New + → Web Service**, conecte o
      repo, Runtime = **Python 3**, Build Command = `pip install -r requirements.txt`,
-     Start Command = `python hik_lpr_listener.py`.
-3. Quando o Render pedir, preencha as variáveis marcadas como secretas
-   (`CAMERA_HOST`, `CAMERA_PASS`, `BACKEND_WEBHOOK_URL`) — as demais já vêm
-   com valor padrão no `render.yaml` e podem ser ajustadas depois em
-   **Environment**.
-4. Depois do primeiro deploy, o Render te dá uma URL pública, algo como
-   `https://hik-lpr-listener.onrender.com`. Configure na câmera
-   (Configuration → Rede → Ligação de dados → ISAPI Listening):
-   - **ANPR IP/Domínio**: `hik-lpr-listener.onrender.com`
-   - **ANPR Porta**: `443` (HTTPS) — o Render já termina TLS por você
-   - **URL anfitrião**: `/lpr`
+     Start Command = `python event_listener.py`.
+3. Depois do primeiro deploy, o Render te dá uma URL pública, algo como
+   `https://event-listener.onrender.com`. Configure essa URL em cada
+   dispositivo (Configuration → Rede → Ligação de dados → ISAPI Listening,
+   o caminho exato varia por modelo):
+   - **IP/Domínio**: `event-listener.onrender.com`
+   - **Porta**: `443` (HTTPS) — o Render já termina TLS por você
+   - **URL anfitrião**: `/evento` (ou qualquer caminho — o servidor aceita
+     POST/GET em qualquer path)
 
-### Variáveis de ambiente
+### Observação importante
 
-| Variável              | Descrição                                                         | Padrão      |
-|-----------------------|---------------------------------------------------------------------|-------------|
-| `CAMERA_HOST`         | IP/domínio da câmera (para chamadas ISAPI de volta)                 | *(vazio)*   |
-| `CAMERA_PORT`         | Porta HTTP/HTTPS da câmera                                          | `8420`      |
-| `CAMERA_USER`         | Usuário ISAPI da câmera                                             | `admin`     |
-| `CAMERA_PASS`         | Senha ISAPI da câmera                                                | *(vazio)*   |
-| `CAMERA_USE_HTTPS`    | `true`/`false` — usar HTTPS ao chamar a câmera                      | `false`     |
-| `AUTO_ABRIR_BARREIRA` | `true`/`false` — abrir a barreira automaticamente por whitelist local| `false`     |
-| `PLACAS_AUTORIZADAS`  | Placas de teste autorizadas, separadas por vírgula                  | `TEST1234`  |
-| `BACKEND_WEBHOOK_URL` | URL do backend real que recebe cada evento decodificado (POST JSON) | *(vazio)*   |
-| `PORT`                | Definida automaticamente pelo Render — não precisa configurar       | `8000`      |
-
-### Observações importantes
-
-- **Disco efêmero**: o Render reinicia o filesystem a cada deploy/restart.
-  As imagens e XMLs salvos em `recebidos/` são perdidos nesse momento — isso
-  serve para depuração pontual, não como armazenamento definitivo. Se
-  precisar reter esses arquivos, grave-os num serviço externo (S3, backend
-  próprio, etc.) em vez de depender do disco local.
-- **`AUTO_ABRIR_BARREIRA`**: mantenha `false` em produção a menos que a
-  decisão de autorização realmente deva vir da whitelist fixa deste
-  script — o normal é essa lógica morar no backend real.
+**Disco efêmero**: o Render reinicia o filesystem a cada deploy/restart. Os
+arquivos salvos em `recebidos/` (imagens/XML) são perdidos nesse momento —
+serve só pra depuração pontual, olhar os logs no dashboard do Render
+enquanto testa cada dispositivo, não como armazenamento definitivo.

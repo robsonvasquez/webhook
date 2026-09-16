@@ -1,24 +1,7 @@
 services:
   - type: web
-    name: hik-lpr-listener
+    name: event-listener
     runtime: python
     plan: starter
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python hik_lpr_listener.py"
-    envVars:
-      - key: CAMERA_HOST
-        sync: false
-      - key: CAMERA_PORT
-        value: "8420"
-      - key: CAMERA_USER
-        value: admin
-      - key: CAMERA_PASS
-        sync: false
-      - key: CAMERA_USE_HTTPS
-        value: "false"
-      - key: AUTO_ABRIR_BARREIRA
-        value: "false"
-      - key: PLACAS_AUTORIZADAS
-        value: "TEST1234"
-      - key: BACKEND_WEBHOOK_URL
-        sync: false
+    startCommand: "python event_listener.py"
