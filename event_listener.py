@@ -30,8 +30,11 @@ estrutura do evento de cada tipo de dispositivo.
 Abrindo a URL raiz ("/") num navegador, você vê os eventos chegando ao vivo
 (via Server-Sent Events), sem precisar dar refresh — útil pra acompanhar o
 cadastro de cada dispositivo sem depender dos logs do Render. Os eventos são
-agrupados por IP de origem: clique num "chip" de dispositivo pra filtrar só
-os eventos dele.
+agrupados pelo IP interno do equipamento (extraído de dentro do próprio XML
+do evento, não da conexão TCP — na Render, vários dispositivos atrás do
+mesmo roteador chegam com o mesmo IP de conexão): clique num "chip" de
+dispositivo pra filtrar só os eventos dele. Cada dispositivo e tipo de
+evento (ANPR, heartBeat, etc.) ganham uma cor pra facilitar identificar.
 
 Os arquivos salvos em recebidos/ são apagados automaticamente (por idade e
 por tamanho total — veja LIMPEZA_* abaixo), pra não estourar o disco do
@@ -200,12 +203,15 @@ VIEWER_HTML = """<!doctype html>
   #status.down { background:#3d1212; color:#e37a7a; }
   #dispositivos { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
   .chip { font: inherit; font-size:12px; color:#a9bbcc; background:#182430; border:1px solid #24303c;
-          border-radius:999px; padding:4px 10px; cursor:pointer; }
+          border-radius:999px; padding:4px 10px 4px 8px; cursor:pointer; display:inline-flex; align-items:center; gap:6px; }
   .chip:hover { border-color:#3a4c60; }
   .chip.ativo { background:#1b3550; border-color:#3f7dc9; color:#cfe3fb; }
+  .bolinha { width:8px; height:8px; border-radius:50%; flex:none; }
   main { padding:12px 16px 40px; max-width:900px; margin:0 auto; }
-  .evento { border:1px solid #24303c; border-radius:8px; padding:10px 12px; margin-bottom:10px; background:#0f151c; }
-  .evento .meta { color:#7ea0c2; font-size:12px; margin-bottom:6px; }
+  .evento { border:1px solid #24303c; border-left-width:4px; border-radius:8px; padding:10px 12px;
+            margin-bottom:10px; background:#0f151c; }
+  .evento .meta { color:#7ea0c2; font-size:12px; margin-bottom:6px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .badge-tipo { font-size:11px; font-weight:600; padding:1px 8px; border-radius:999px; color:#fff; }
   .evento pre { white-space: pre-wrap; word-break: break-word; margin:0; font-size:12.5px; line-height:1.4; }
   .evento .imagens { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
   .evento .imagens img { max-width:220px; max-height:220px; border-radius:6px; border:1px solid #24303c; }
@@ -230,21 +236,41 @@ VIEWER_HTML = """<!doctype html>
   const status = document.getElementById('status');
   const dispositivos = document.getElementById('dispositivos');
 
-  let filtro = null; // null = mostra todos; string = só esse IP
-  const contagem = {}; // ip -> quantidade de eventos vistos
+  let filtro = null; // null = mostra todos; string = só esse dispositivo
+  const contagem = {}; // dispositivo -> quantidade de eventos vistos
 
-  function chipDoIp(ip) {
-    return dispositivos.querySelector(`[data-ip="${CSS.escape(ip)}"]`);
+  const CORES_TIPO = {
+    ANPR: '#3f7dc9',
+    heartBeat: '#4b5a68',
+    facedetection: '#a855f7',
+    facerecognition: '#a855f7',
+    alarm: '#e5484d',
+    videoloss: '#e5484d',
+  };
+
+  function corDoDispositivo(id) {
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+    return `hsl(${hash % 360}, 65%, 55%)`;
   }
 
-  function selecionarFiltro(ip) {
-    filtro = (filtro === ip) ? null : ip;
-    dispositivos.querySelectorAll('.chip').forEach(btn => {
-      btn.classList.toggle('ativo', btn.dataset.ip === filtro);
+  function corDoTipo(tipo) {
+    if (!tipo) return '#3a4c60';
+    return CORES_TIPO[tipo] || CORES_TIPO[tipo.toLowerCase()] || '#3f9f7a';
+  }
+
+  function chipDoDispositivo(id) {
+    return dispositivos.querySelector(`[data-dispositivo="${CSS.escape(id)}"]`);
+  }
+
+  function selecionarFiltro(id) {
+    filtro = (filtro === id) ? null : id;
+    dispositivos.querySelectorAll('.chip[data-dispositivo]').forEach(btn => {
+      btn.classList.toggle('ativo', btn.dataset.dispositivo === filtro);
     });
     todosBtn.classList.toggle('ativo', !filtro);
     document.querySelectorAll('.evento').forEach(div => {
-      div.style.display = (!filtro || div.dataset.ip === filtro) ? '' : 'none';
+      div.style.display = (!filtro || div.dataset.dispositivo === filtro) ? '' : 'none';
     });
   }
 
@@ -254,29 +280,52 @@ VIEWER_HTML = """<!doctype html>
   todosBtn.onclick = () => selecionarFiltro(null);
   dispositivos.appendChild(todosBtn);
 
-  function registrarDispositivo(ip) {
-    contagem[ip] = (contagem[ip] || 0) + 1;
-    let chip = chipDoIp(ip);
+  function registrarDispositivo(id) {
+    contagem[id] = (contagem[id] || 0) + 1;
+    let chip = chipDoDispositivo(id);
     if (!chip) {
       chip = document.createElement('button');
       chip.className = 'chip';
-      chip.dataset.ip = ip;
-      chip.onclick = () => selecionarFiltro(ip);
+      chip.dataset.dispositivo = id;
+      chip.onclick = () => selecionarFiltro(id);
+      const bolinha = document.createElement('span');
+      bolinha.className = 'bolinha';
+      bolinha.style.background = corDoDispositivo(id);
+      chip.appendChild(bolinha);
+      chip.appendChild(document.createTextNode(''));
       dispositivos.appendChild(chip);
     }
-    chip.textContent = `${ip} (${contagem[ip]})`;
+    chip.lastChild.textContent = `${id} (${contagem[id]})`;
+  }
+
+  function pertoDoFim() {
+    return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 80);
   }
 
   function addEvento(ev) {
     vazio.style.display = 'none';
-    registrarDispositivo(ev.ip);
+    registrarDispositivo(ev.dispositivo);
+    const deveRolar = pertoDoFim();
+
     const div = document.createElement('div');
     div.className = 'evento';
-    div.dataset.ip = ev.ip;
-    if (filtro && ev.ip !== filtro) div.style.display = 'none';
+    div.dataset.dispositivo = ev.dispositivo;
+    div.style.borderLeftColor = corDoDispositivo(ev.dispositivo);
+    if (filtro && ev.dispositivo !== filtro) div.style.display = 'none';
+
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = `[${ev.ts}] ${ev.metodo} ${ev.path}  de ${ev.ip}`;
+    if (ev.tipo) {
+      const badge = document.createElement('span');
+      badge.className = 'badge-tipo';
+      badge.style.background = corDoTipo(ev.tipo);
+      badge.textContent = ev.tipo;
+      meta.appendChild(badge);
+    }
+    meta.appendChild(document.createTextNode(
+      `[${ev.ts}] ${ev.metodo} ${ev.path}  — ${ev.dispositivo}`
+    ));
+
     const pre = document.createElement('pre');
     pre.textContent = ev.texto;
     div.appendChild(meta);
@@ -298,7 +347,7 @@ VIEWER_HTML = """<!doctype html>
       div.appendChild(imgs);
     }
     log.appendChild(div);
-    window.scrollTo(0, document.body.scrollHeight);
+    if (deveRolar) window.scrollTo(0, document.body.scrollHeight);
   }
 
   function connect() {
@@ -414,6 +463,8 @@ class EventHandler(BaseHTTPRequestHandler):
     def _handle(self):
         self._lines = []
         self._imagens = []
+        self._dispositivo = None
+        self._tipo = None
         ts = self._log_common()
         length = int(self.headers.get("Content-Length", 0))
         content_type = self.headers.get("Content-Type", "")
@@ -458,6 +509,14 @@ class EventHandler(BaseHTTPRequestHandler):
                                 self._out("Campos do evento (achatado, sem namespace):")
                                 self._out(json.dumps(flat, indent=2, ensure_ascii=False))
                                 self._out("")
+                                # Identifica o dispositivo pelo IP/MAC de dentro do
+                                # próprio XML — na Render, o IP da conexão TCP é o do
+                                # proxy (ou o IP público compartilhado pelo roteador
+                                # de todos os dispositivos da mesma rede local).
+                                if self._dispositivo is None:
+                                    self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
+                                if self._tipo is None:
+                                    self._tipo = flat.get("eventType")
                     else:
                         ext = "jpg" if is_jpeg else ("png" if is_png else "bin")
                         base = part["filename"] or f"{name}.{ext}"
@@ -478,6 +537,11 @@ class EventHandler(BaseHTTPRequestHandler):
             self._out("Corpo:")
             self._out(text)
 
+            if text.lstrip().startswith("<"):
+                flat = flatten_xml(text)
+                self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
+                self._tipo = flat.get("eventType")
+
         self._out("=" * 70 + "\n")
 
         broadcast({
@@ -485,6 +549,8 @@ class EventHandler(BaseHTTPRequestHandler):
             "metodo": self.command,
             "path": self.path,
             "ip": self.client_address[0],
+            "dispositivo": self._dispositivo or self.client_address[0],
+            "tipo": self._tipo,
             "texto": "\n".join(self._lines),
             "imagens": self._imagens,
         })

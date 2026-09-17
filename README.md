@@ -15,8 +15,11 @@ chegando **ao vivo**, sem precisar dar refresh — não precisa entrar no
 dashboard do Render pra acompanhar. Quando o dispositivo manda uma imagem
 (ex.: foto da placa/rosto capturados), a miniatura aparece direto no card do
 evento. Com vários dispositivos cadastrados no mesmo webhook, os eventos são
-agrupados por IP de origem — clique no "chip" de um dispositivo pra ver só
-os eventos dele. Configure o dispositivo pra mandar os eventos pra qualquer
+agrupados pelo IP interno de cada equipamento (lido de dentro do XML do
+evento — não do IP da conexão, que na Render é o mesmo pra todos os
+dispositivos atrás do mesmo roteador). Cada dispositivo e tipo de evento
+ganham uma cor; clique no "chip" de um dispositivo pra ver só os eventos
+dele. Configure o dispositivo pra mandar os eventos pra qualquer
 outro path (`/evento`, por exemplo) — `/`, `/stream`, `/events.json` e
 `/recebidos/*` são reservados para essa visualização.
 
