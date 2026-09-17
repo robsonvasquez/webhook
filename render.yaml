@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: event-listener
-    runtime: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python event_listener.py"

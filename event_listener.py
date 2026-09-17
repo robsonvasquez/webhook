@@ -1,44 +1,58 @@
 """
-Servidor HTTP simples para inspecionar os eventos que dispositivos Hikvision
-(câmeras LPR/ANPR, terminais de reconhecimento facial, controladoras de
-acesso, etc.) enviam via ISAPI Listening (POST HTTP, multipart quando
-"Upload Binary Image" está ativado no dispositivo).
+Servidor HTTP genérico para inspecionar eventos recebidos via webhook — POST
+(ou GET) com corpo JSON, XML ou multipart/form-data (com imagens), de
+qualquer dispositivo ou sistema, em qualquer path.
+
+Tem tratamento especial para eventos no formato ISAPI da Hikvision (câmeras
+LPR/ANPR, terminais de reconhecimento facial, controladoras de acesso,
+etc.): o XML é achatado em JSON e o dispositivo de origem/resumo são
+extraídos automaticamente. Qualquer outro tipo de payload continua sendo
+logado normalmente, só sem esse enriquecimento extra.
 
 Serve só para OBSERVAR o formato/conteúdo dos eventos ao cadastrar este
-servidor em cada dispositivo — não decide nada nem aciona nada de volta.
+servidor onde for preciso testar uma integração — não decide nada nem aciona
+nada de volta.
 
 Uso:
     python event_listener.py [porta]
 
-Padrão: porta 8000, ou a variável de ambiente PORT (usada em produção/Render).
+Padrão: porta 8000, ou a variável de ambiente PORT quando ela existir
+(convenção comum na maioria das plataformas de deploy).
 
-No dispositivo, configure em Configuration > Rede > Ligação de dados > ISAPI
-Listening (o caminho exato varia por modelo/firmware):
+Configure no dispositivo/sistema de origem a URL deste servidor + um path
+qualquer, por exemplo:
     IP/Domínio    : <IP/domínio deste servidor>
     Porta         : 8000  (ou a porta que você passar como argumento/PORT)
-    URL anfitrião : /evento   (qualquer path funciona, EXCETO "/", "/stream",
-                                "/events.json" e "/recebidos/*", reservados
-                                para a página de visualização ao vivo abaixo)
+    URL/Path      : /evento   (qualquer path funciona, EXCETO "/", "/stream",
+                                "/events.json", "/recebidos/*" e
+                                "/reenviar/*", reservados para a página de
+                                visualização ao vivo abaixo)
 
 Todo POST/GET recebido é logado no terminal com headers e corpo. Quando o
 corpo é multipart/form-data, cada parte é salva em recebidos/: texto
 (XML/JSON) é impresso e salvo como .txt/.xml; imagens (quando "Upload Binary
-Image" está ligado) são salvas como .jpg/.png. Partes em XML também têm seus
-campos "achatados" (sem namespace) impressos como JSON, pra facilitar ver a
-estrutura do evento de cada tipo de dispositivo.
+Image" está ligado, no caso Hikvision) são salvas como .jpg/.png. Partes em
+XML também têm seus campos "achatados" (sem namespace) impressos como JSON,
+pra facilitar ver a estrutura do evento de cada tipo de dispositivo.
 
 Abrindo a URL raiz ("/") num navegador, você vê os eventos chegando ao vivo
-(via Server-Sent Events), sem precisar dar refresh — útil pra acompanhar o
-cadastro de cada dispositivo sem depender dos logs do Render. Os eventos são
+(via Server-Sent Events), sem precisar dar refresh. Os eventos são
 agrupados pelo IP interno do equipamento (extraído de dentro do próprio XML
-do evento, não da conexão TCP — na Render, vários dispositivos atrás do
-mesmo roteador chegam com o mesmo IP de conexão): clique num "chip" de
+do evento, não da conexão TCP — atrás de proxy/CDN, vários dispositivos da
+mesma rede costumam chegar com o mesmo IP de conexão): clique num "chip" de
 dispositivo pra filtrar só os eventos dele. Cada dispositivo e tipo de
 evento (ANPR, heartBeat, etc.) ganham uma cor pra facilitar identificar.
 
-Os arquivos salvos em recebidos/ são apagados automaticamente (por idade e
-por tamanho total — veja LIMPEZA_* abaixo), pra não estourar o disco do
-plano Free do Render.
+Os arquivos salvos em recebidos/ (e o corpo bruto em recebidos_raw/, usado
+pelo botão "Reenviar…") são apagados automaticamente (por idade e por
+tamanho total — veja LIMPEZA_* abaixo), pra não depender de armazenamento
+permanente em ambientes com disco efêmero.
+
+A página também tem: Pausar/Retomar (congela a tela sem perder eventos),
+Limpar tela, download de cada XML/JSON recebido, e "Reenviar…" pra reenviar
+o payload original de um evento pra uma URL escolhida na hora (útil pra
+testar o backend real sem precisar acionar o dispositivo de novo — recusa
+URLs que apontem pra rede interna).
 """
 
 import sys
@@ -46,36 +60,52 @@ import os
 import re
 import json
 import queue
+import socket
+import ipaddress
 import threading
 import time
+import uuid
 import urllib.parse
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-IMAGE_CONTENT_TYPES = {
+IMAGEM_CONTENT_TYPES = {
     "jpg": "image/jpeg",
     "jpeg": "image/jpeg",
     "png": "image/png",
+}
+TEXTO_CONTENT_TYPES = {
+    "xml": "application/xml; charset=utf-8",
+    "json": "application/json; charset=utf-8",
+    "txt": "text/plain; charset=utf-8",
 }
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recebidos")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Limpeza automática de recebidos/, pra não estourar o disco do plano Free
-# do Render: apaga o que passou da idade máxima e, se mesmo assim o total
-# ainda passar do tamanho máximo, apaga do arquivo mais antigo pro mais novo.
+# Corpo bruto de cada requisição (pra função "reenviar evento"), guardado à
+# parte de recebidos/ pra não ficar exposto publicamente via /recebidos/.
+RAW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recebidos_raw")
+os.makedirs(RAW_DIR, exist_ok=True)
+
+# Limpeza automática de recebidos/ e recebidos_raw/, pra não estourar o disco
+# em ambientes com armazenamento limitado: apaga o que passou da idade
+# máxima e, se mesmo assim o total ainda passar do tamanho máximo, apaga do
+# mais antigo pro mais novo.
 LIMPEZA_INTERVALO_SEGUNDOS = 600
 LIMPEZA_IDADE_MAXIMA_SEGUNDOS = 6 * 3600
 LIMPEZA_TAMANHO_MAXIMO_BYTES = 200 * 1024 * 1024
 
 
-def limpar_recebidos():
+def limpar_pasta(pasta):
     agora = time.time()
     try:
         arquivos = []
-        for nome in os.listdir(SAVE_DIR):
-            caminho = os.path.join(SAVE_DIR, nome)
+        for nome in os.listdir(pasta):
+            caminho = os.path.join(pasta, nome)
             try:
                 stat = os.stat(caminho)
             except OSError:
@@ -99,13 +129,35 @@ def limpar_recebidos():
             total -= tamanho
             i += 1
     except Exception as e:
-        print(f"Falha na limpeza de {SAVE_DIR}: {e}")
+        print(f"Falha na limpeza de {pasta}: {e}")
 
 
 def loop_limpeza():
     while True:
-        limpar_recebidos()
+        limpar_pasta(SAVE_DIR)
+        limpar_pasta(RAW_DIR)
         time.sleep(LIMPEZA_INTERVALO_SEGUNDOS)
+
+
+def url_e_publica(url: str) -> bool:
+    """Recusa reenviar eventos pra localhost/rede interna — evita que a
+    função de reenvio vire um proxy pra atacar a infraestrutura interna da
+    hospedagem onde este servidor estiver rodando."""
+    try:
+        partes = urllib.parse.urlparse(url)
+        if partes.scheme not in ("http", "https") or not partes.hostname:
+            return False
+        ip = socket.gethostbyname(partes.hostname)
+        endereco = ipaddress.ip_address(ip)
+        return not (
+            endereco.is_private
+            or endereco.is_loopback
+            or endereco.is_link_local
+            or endereco.is_reserved
+            or endereco.is_multicast
+        )
+    except Exception:
+        return False
 
 
 # Buffer dos últimos eventos (pra quem abrir a página depois de eventos já
@@ -153,6 +205,21 @@ def flatten_xml(xml_text: str) -> dict:
     return flat
 
 
+def resumir_campos(flat: dict) -> str:
+    """Extrai uma linha curta e legível dos campos achatados, pra mostrar no
+    cabeçalho do evento sem precisar expandir. Cobre os casos mais comuns
+    (ANPR, facial, heartbeat) e cai pro eventType/eventDescription genérico
+    pros outros tipos de dispositivo."""
+    placa = flat.get("licensePlate")
+    if placa and placa.lower() != "unknown":
+        conf = flat.get("confidenceLevel")
+        return f"placa {placa}" + (f" ({conf}%)" if conf else "")
+    nome = flat.get("name") or flat.get("employeeNoString") or flat.get("employeeNo")
+    if nome:
+        return f"pessoa {nome}"
+    return flat.get("eventDescription") or flat.get("eventType") or ""
+
+
 def parse_multipart(body: bytes, boundary: bytes):
     """Parser manual e simples de multipart/form-data.
     Retorna uma lista de dicts: {"name": str, "filename": str|None,
@@ -196,11 +263,17 @@ VIEWER_HTML = """<!doctype html>
   body { margin:0; font-family: ui-monospace, Menlo, Consolas, monospace; background:#0b0f14; color:#d7e0ea; }
   header { position:sticky; top:0; background:#111820; padding:10px 16px; border-bottom:1px solid #24303c;
            z-index:1; }
-  .header-top { display:flex; align-items:center; gap:10px; }
+  .header-top { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   header h1 { font-size:14px; font-weight:600; margin:0; }
   #status { font-size:12px; padding:2px 8px; border-radius:10px; }
   #status.ok { background:#123d24; color:#5fd58a; }
   #status.down { background:#3d1212; color:#e37a7a; }
+  .header-acoes { display:flex; gap:6px; margin-left:auto; }
+  .btn-mini { font: inherit; font-size:12px; color:#a9bbcc; background:#182430; border:1px solid #24303c;
+              border-radius:6px; padding:4px 10px; cursor:pointer; }
+  .btn-mini:hover { border-color:#3a4c60; color:#cfe3fb; }
+  .btn-mini.ativo { background:#4a2a12; border-color:#c97a3f; color:#f0c9a3; }
+  .btn-mini:disabled { opacity:0.6; cursor:default; }
   #dispositivos { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
   .chip { font: inherit; font-size:12px; color:#a9bbcc; background:#182430; border:1px solid #24303c;
           border-radius:999px; padding:4px 10px 4px 8px; cursor:pointer; display:inline-flex; align-items:center; gap:6px; }
@@ -221,6 +294,11 @@ VIEWER_HTML = """<!doctype html>
   .evento pre { white-space: pre-wrap; word-break: break-word; margin:0; font-size:12.5px; line-height:1.4; }
   .evento .imagens { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
   .evento .imagens img { max-width:220px; max-height:220px; border-radius:6px; border:1px solid #24303c; }
+  .evento.recolhido .arquivos { display:none; }
+  .arquivos { display:flex; flex-direction:column; gap:4px; margin-top:8px; }
+  .link-arquivo { font-size:12px; color:#7ea0c2; text-decoration:none; }
+  .link-arquivo:hover { text-decoration:underline; color:#cfe3fb; }
+  .resumo { color:#e3c17a; font-weight:600; }
   #vazio { color:#5c6b7a; padding:20px 0; }
 </style>
 </head>
@@ -229,6 +307,10 @@ VIEWER_HTML = """<!doctype html>
   <div class="header-top">
     <h1>Event Listener &mdash; ao vivo</h1>
     <span id="status" class="down">conectando&hellip;</span>
+    <div class="header-acoes">
+      <button id="pausarBtn" class="btn-mini">Pausar</button>
+      <button id="limparBtn" class="btn-mini">Limpar tela</button>
+    </div>
   </div>
   <div id="dispositivos"></div>
 </header>
@@ -343,6 +425,22 @@ VIEWER_HTML = """<!doctype html>
     meta.appendChild(document.createTextNode(
       `[${ev.ts}] ${ev.metodo} ${ev.path}  — ${ev.dispositivo}`
     ));
+    if (ev.resumo) {
+      const resumo = document.createElement('span');
+      resumo.className = 'resumo';
+      resumo.textContent = ev.resumo;
+      meta.appendChild(resumo);
+    }
+    if (ev.tem_raw && ev.id) {
+      const reenviarBtn = document.createElement('button');
+      reenviarBtn.className = 'btn-mini';
+      reenviarBtn.textContent = 'Reenviar…';
+      reenviarBtn.onclick = (clique) => {
+        clique.stopPropagation();
+        reenviarEvento(ev.id, reenviarBtn);
+      };
+      meta.appendChild(reenviarBtn);
+    }
 
     const pre = document.createElement('pre');
     pre.textContent = ev.texto;
@@ -364,8 +462,78 @@ VIEWER_HTML = """<!doctype html>
       }
       div.appendChild(imgs);
     }
+    if (ev.textos && ev.textos.length) {
+      const arquivos = document.createElement('div');
+      arquivos.className = 'arquivos';
+      for (const fname of ev.textos) {
+        const a = document.createElement('a');
+        a.className = 'link-arquivo';
+        a.href = '/recebidos/' + encodeURIComponent(fname);
+        a.textContent = '📄 ' + fname;
+        arquivos.appendChild(a);
+      }
+      div.appendChild(arquivos);
+    }
     log.appendChild(div);
     if (deveRolar) window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  function reenviarEvento(id, btn) {
+    let destino = '';
+    try { destino = localStorage.getItem('destino_reenvio') || ''; } catch (err) {}
+    destino = window.prompt('Reenviar este evento (payload original) para qual URL?', destino);
+    if (!destino) return;
+    try { localStorage.setItem('destino_reenvio', destino); } catch (err) {}
+
+    const textoOriginal = btn.textContent;
+    btn.textContent = 'Enviando…';
+    btn.disabled = true;
+    fetch('/reenviar/' + id, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: destino }),
+    })
+      .then(r => r.json())
+      .then(res => {
+        btn.textContent = res.ok ? `OK (${res.status})` : `Falhou: ${res.erro || res.status || '?'}`;
+      })
+      .catch(() => { btn.textContent = 'Erro de rede'; })
+      .finally(() => {
+        setTimeout(() => { btn.textContent = textoOriginal; btn.disabled = false; }, 3000);
+      });
+  }
+
+  let pausado = false;
+  let filaPendente = [];
+  const pausarBtn = document.getElementById('pausarBtn');
+  const limparBtn = document.getElementById('limparBtn');
+
+  pausarBtn.onclick = () => {
+    pausado = !pausado;
+    pausarBtn.classList.toggle('ativo', pausado);
+    if (!pausado) {
+      const pendentes = filaPendente;
+      filaPendente = [];
+      pausarBtn.textContent = 'Pausar';
+      pendentes.forEach(addEvento);
+    } else {
+      pausarBtn.textContent = 'Retomar';
+    }
+  };
+
+  limparBtn.onclick = () => {
+    log.innerHTML = '';
+    Object.keys(ultimoPorDispositivo).forEach(k => delete ultimoPorDispositivo[k]);
+    vazio.style.display = '';
+  };
+
+  function processarEvento(ev) {
+    if (pausado) {
+      filaPendente.push(ev);
+      pausarBtn.textContent = `Retomar (${filaPendente.length})`;
+      return;
+    }
+    addEvento(ev);
   }
 
   function connect() {
@@ -373,7 +541,7 @@ VIEWER_HTML = """<!doctype html>
     es.onopen = () => { status.textContent = 'ao vivo'; status.className = 'ok'; };
     es.onerror = () => { status.textContent = 'reconectando…'; status.className = 'down'; };
     es.onmessage = (e) => {
-      try { addEvento(JSON.parse(e.data)); } catch (err) { console.error(err); }
+      try { processarEvento(JSON.parse(e.data)); } catch (err) { console.error(err); }
     };
   }
   connect();
@@ -400,8 +568,9 @@ class EventHandler(BaseHTTPRequestHandler):
     def _serve_recebido(self):
         fname = os.path.basename(urllib.parse.unquote(self.path[len("/recebidos/"):].split("?", 1)[0]))
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+        content_type = IMAGEM_CONTENT_TYPES.get(ext) or TEXTO_CONTENT_TYPES.get(ext)
         fpath = os.path.join(SAVE_DIR, fname)
-        if not fname or ext not in IMAGE_CONTENT_TYPES or not os.path.isfile(fpath):
+        if not fname or not content_type or not os.path.isfile(fpath):
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -409,11 +578,52 @@ class EventHandler(BaseHTTPRequestHandler):
         with open(fpath, "rb") as f:
             data = f.read()
         self.send_response(200)
-        self.send_header("Content-Type", IMAGE_CONTENT_TYPES[ext])
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if ext in TEXTO_CONTENT_TYPES:
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_reenviar(self):
+        evento_id = os.path.basename(self.path[len("/reenviar/"):].split("?", 1)[0])
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            payload = {}
+        destino = (payload.get("url") or "").strip()
+
+        resultado = {"ok": False, "erro": None}
+        raw_path = os.path.join(RAW_DIR, f"{evento_id}.raw")
+        if not url_e_publica(destino):
+            resultado["erro"] = "URL inválida ou aponta pra rede interna"
+        elif not os.path.isfile(raw_path):
+            resultado["erro"] = "corpo do evento expirado ou não encontrado"
+        else:
+            with STATE_LOCK:
+                original = next((e for e in EVENTS if e.get("id") == evento_id), None)
+            content_type = (original or {}).get("content_type") or "application/octet-stream"
+            with open(raw_path, "rb") as f:
+                dados = f.read()
+            req = urllib.request.Request(
+                destino, data=dados, headers={"Content-Type": content_type}, method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resultado = {"ok": True, "status": resp.status}
+            except urllib.error.HTTPError as e:
+                resultado = {"ok": False, "status": e.code, "erro": str(e)}
+            except Exception as e:
+                resultado = {"ok": False, "erro": str(e)}
+
+        body = json.dumps(resultado).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_events_json(self):
         with STATE_LOCK:
@@ -427,7 +637,8 @@ class EventHandler(BaseHTTPRequestHandler):
 
     def _sse_chunk(self, data: bytes):
         # Transfer-Encoding: chunked manual, pra manter a conexão aberta
-        # (sem Content-Length) de um jeito compatível com proxies (Render).
+        # (sem Content-Length) de um jeito compatível com proxies reversos
+        # comuns em plataformas de deploy.
         size = f"{len(data):x}".encode()
         self.wfile.write(size + b"\r\n" + data + b"\r\n")
         self.wfile.flush()
@@ -481,11 +692,15 @@ class EventHandler(BaseHTTPRequestHandler):
     def _handle(self):
         self._lines = []
         self._imagens = []
+        self._textos = []
         self._dispositivo = None
         self._tipo = None
+        self._resumo = None
+        evento_id = uuid.uuid4().hex[:10]
         ts = self._log_common()
         length = int(self.headers.get("Content-Length", 0))
         content_type = self.headers.get("Content-Type", "")
+        body = self.rfile.read(length) if length > 0 else b""
 
         if length == 0:
             self._out("(sem corpo)")
@@ -496,10 +711,9 @@ class EventHandler(BaseHTTPRequestHandler):
             boundary_match = re.search(r"boundary=(.+)$", content_type)
             if not boundary_match:
                 self._out("(multipart sem boundary identificável, corpo bruto abaixo)")
-                self._out(str(self.rfile.read(length)))
+                self._out(str(body))
             else:
                 boundary = boundary_match.group(1).strip().strip('"').encode("utf-8")
-                body = self.rfile.read(length)
                 for i, part in enumerate(parse_multipart(body, boundary)):
                     name = part["name"] or f"campo_{i}"
                     data = part["data"]
@@ -517,6 +731,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         fpath = os.path.join(SAVE_DIR, fname)
                         with open(fpath, "w", encoding="utf-8") as f:
                             f.write(text)
+                        self._textos.append(fname)
                         self._out(f"Campo '{name}' (texto, salvo em {fpath}):\n{text}\n")
 
                         # Se parecer XML, achata os campos e mostra como JSON
@@ -528,13 +743,16 @@ class EventHandler(BaseHTTPRequestHandler):
                                 self._out(json.dumps(flat, indent=2, ensure_ascii=False))
                                 self._out("")
                                 # Identifica o dispositivo pelo IP/MAC de dentro do
-                                # próprio XML — na Render, o IP da conexão TCP é o do
-                                # proxy (ou o IP público compartilhado pelo roteador
-                                # de todos os dispositivos da mesma rede local).
+                                # próprio XML — atrás de proxy/CDN, o IP da conexão
+                                # TCP costuma ser o do proxy (ou o IP público
+                                # compartilhado pelo roteador de todos os
+                                # dispositivos da mesma rede local).
                                 if self._dispositivo is None:
                                     self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
                                 if self._tipo is None:
                                     self._tipo = flat.get("eventType")
+                                if self._resumo is None:
+                                    self._resumo = resumir_campos(flat)
                     else:
                         ext = "jpg" if is_jpeg else ("png" if is_png else "bin")
                         base = part["filename"] or f"{name}.{ext}"
@@ -547,7 +765,6 @@ class EventHandler(BaseHTTPRequestHandler):
                         self._out(f"Campo '{name}': imagem salva em {fpath} ({len(data)} bytes)")
         else:
             # Corpo simples (JSON, XML ou texto puro)
-            body = self.rfile.read(length)
             try:
                 text = body.decode("utf-8", errors="replace")
             except Exception:
@@ -555,22 +772,38 @@ class EventHandler(BaseHTTPRequestHandler):
             self._out("Corpo:")
             self._out(text)
 
-            if text.lstrip().startswith("<"):
+            ext = "xml" if text.lstrip().startswith("<") else ("json" if text.lstrip().startswith("{") else "txt")
+            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_corpo.{ext}"
+            with open(os.path.join(SAVE_DIR, fname), "w", encoding="utf-8") as f:
+                f.write(text)
+            self._textos.append(fname)
+
+            if ext == "xml":
                 flat = flatten_xml(text)
                 self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
                 self._tipo = flat.get("eventType")
+                self._resumo = resumir_campos(flat)
 
         self._out("=" * 70 + "\n")
 
+        if body:
+            with open(os.path.join(RAW_DIR, f"{evento_id}.raw"), "wb") as f:
+                f.write(body)
+
         broadcast({
+            "id": evento_id,
             "ts": ts,
             "metodo": self.command,
             "path": self.path,
             "ip": self.client_address[0],
             "dispositivo": self._dispositivo or self.client_address[0],
             "tipo": self._tipo,
+            "resumo": self._resumo,
+            "content_type": content_type,
+            "tem_raw": bool(body),
             "texto": "\n".join(self._lines),
             "imagens": self._imagens,
+            "textos": self._textos,
         })
 
         # A Hikvision espera a resposta EXATA "HTTP/1.1 200 " (com espaço após o
@@ -581,6 +814,9 @@ class EventHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if self.path.startswith("/reenviar/"):
+            self._serve_reenviar()
+            return
         self._handle()
 
     def do_GET(self):
@@ -610,8 +846,8 @@ def main():
     if len(sys.argv) > 1:
         port = int(sys.argv[1])
     else:
-        # O Render (e outras plataformas PaaS) definem a porta via variável
-        # de ambiente PORT; localmente cai no padrão 8000.
+        # Muitas plataformas de deploy definem a porta via variável de
+        # ambiente PORT; localmente cai no padrão 8000.
         port = int(os.environ.get("PORT", "8000"))
     # ThreadingHTTPServer: a página de visualização ao vivo mantém uma
     # conexão aberta (SSE), então precisa de mais de uma thread pra não
