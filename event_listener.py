@@ -17,7 +17,11 @@ O ACK ("HTTP/1.1 200 ", exigido pela Hikvision) é enviado assim que o corpo
 da requisição termina de chegar, ANTES de logar/gravar/processar qualquer
 coisa — dispositivos (ou proxies no caminho) costumam reenviar o mesmo
 evento por timeout se a resposta demorar, o que aparece como eventos
-"duplicados" que na real são retries do mesmo evento original.
+"duplicados" que na real são retries do mesmo evento original. Como
+segunda camada de proteção, eventos Hikvision com o mesmo <UUID> de um
+evento processado há pouco (retry de verdade, não uma nova detecção) são
+descartados: nada é salvo em disco nem aparece na página — veja UUID_* mais
+abaixo.
 
 Uso:
     python event_listener.py [porta]
@@ -184,6 +188,31 @@ def broadcast(evento: dict):
         subscribers = list(SUBSCRIBERS)
     for q in subscribers:
         q.put(evento)
+
+
+# Dedup de retries: a Hikvision inclui um <UUID> por detecção dentro do XML
+# do evento — se a câmera não recebe o ACK a tempo, ela reenvia o MESMO
+# evento (mesmo UUID), não gera um novo. Um evento com um UUID já visto
+# há pouco tempo é descartado (não salva arquivo nem aparece na página).
+UUID_JANELA_SEGUNDOS = 120
+UUID_MAX_MEMORIA = 2000
+UUIDS_LOCK = threading.Lock()
+UUIDS_VISTOS = {}  # uuid -> monotonic() da primeira vez que foi processado
+
+
+def evento_e_duplicado(uuid_evento):
+    if not uuid_evento:
+        return False
+    agora = time.monotonic()
+    with UUIDS_LOCK:
+        visto_em = UUIDS_VISTOS.get(uuid_evento)
+        if visto_em is not None and (agora - visto_em) < UUID_JANELA_SEGUNDOS:
+            return True
+        UUIDS_VISTOS[uuid_evento] = agora
+        if len(UUIDS_VISTOS) > UUID_MAX_MEMORIA:
+            mais_antigo = min(UUIDS_VISTOS, key=UUIDS_VISTOS.get)
+            del UUIDS_VISTOS[mais_antigo]
+        return False
 
 
 def flatten_xml(xml_text: str) -> dict:
@@ -700,6 +729,7 @@ class EventHandler(BaseHTTPRequestHandler):
         self._dispositivo = None
         self._tipo = None
         self._resumo = None
+        self._descartado = False
         evento_id = uuid.uuid4().hex[:10]
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         length = int(self.headers.get("Content-Length", 0))
@@ -732,55 +762,81 @@ class EventHandler(BaseHTTPRequestHandler):
                 self._out(str(body))
             else:
                 boundary = boundary_match.group(1).strip().strip('"').encode("utf-8")
-                for i, part in enumerate(parse_multipart(body, boundary)):
-                    name = part["name"] or f"campo_{i}"
-                    data = part["data"]
-                    is_jpeg = data[:2] == b"\xff\xd8"
-                    is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
-                    looks_like_text = (part["filename"] or "").lower().endswith((".xml", ".json", ".txt")) or (
-                        not is_jpeg and not is_png and data[:1] in (b"<", b"{")
+                partes = parse_multipart(body, boundary)
+
+                # Pré-checagem: acha o UUID do evento (campo <UUID> do XML da
+                # Hikvision) ANTES de salvar qualquer coisa, pra poder
+                # descartar retries sem gravar arquivo nem gerar card na
+                # página — a câmera reenvia o MESMO UUID quando não recebe o
+                # ACK a tempo, não gera um novo por detecção.
+                uuid_evento = None
+                for part in partes:
+                    if part["data"][:1] == b"<":
+                        try:
+                            flat_preview = flatten_xml(part["data"].decode("utf-8", errors="replace"))
+                        except Exception:
+                            flat_preview = {}
+                        if flat_preview.get("UUID"):
+                            uuid_evento = flat_preview["UUID"]
+                            break
+
+                if evento_e_duplicado(uuid_evento):
+                    self._out(
+                        f"Evento duplicado descartado — mesmo UUID '{uuid_evento}' de um "
+                        f"retry recente da câmera (não é uma nova detecção). Nada foi "
+                        f"salvo nem exibido na página."
                     )
+                    self._descartado = True
+                else:
+                    for i, part in enumerate(partes):
+                        name = part["name"] or f"campo_{i}"
+                        data = part["data"]
+                        is_jpeg = data[:2] == b"\xff\xd8"
+                        is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
+                        looks_like_text = (part["filename"] or "").lower().endswith((".xml", ".json", ".txt")) or (
+                            not is_jpeg and not is_png and data[:1] in (b"<", b"{")
+                        )
 
-                    if looks_like_text and not is_jpeg and not is_png:
-                        # XML/JSON/texto: imprime formatado no terminal E salva um .txt/.xml pra referência
-                        text = data.decode("utf-8", errors="replace")
-                        fname = part["filename"] or f"{name}.xml"
-                        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{fname}"
-                        fpath = os.path.join(SAVE_DIR, fname)
-                        with open(fpath, "w", encoding="utf-8") as f:
-                            f.write(text)
-                        self._textos.append(fname)
-                        self._out(f"Campo '{name}' (texto, salvo em {fpath}):\n{text}\n")
+                        if looks_like_text and not is_jpeg and not is_png:
+                            # XML/JSON/texto: imprime formatado no terminal E salva um .txt/.xml pra referência
+                            text = data.decode("utf-8", errors="replace")
+                            fname = part["filename"] or f"{name}.xml"
+                            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{evento_id}_{fname}"
+                            fpath = os.path.join(SAVE_DIR, fname)
+                            with open(fpath, "w", encoding="utf-8") as f:
+                                f.write(text)
+                            self._textos.append(fname)
+                            self._out(f"Campo '{name}' (texto, salvo em {fpath}):\n{text}\n")
 
-                        # Se parecer XML, achata os campos e mostra como JSON
-                        # pra facilitar ver a estrutura do evento.
-                        if (part["filename"] or "").lower().endswith(".xml") or text.lstrip().startswith("<"):
-                            flat = flatten_xml(text)
-                            if flat:
-                                self._out("Campos do evento (achatado, sem namespace):")
-                                self._out(json.dumps(flat, indent=2, ensure_ascii=False))
-                                self._out("")
-                                # Identifica o dispositivo pelo IP/MAC de dentro do
-                                # próprio XML — atrás de proxy/CDN, o IP da conexão
-                                # TCP costuma ser o do proxy (ou o IP público
-                                # compartilhado pelo roteador de todos os
-                                # dispositivos da mesma rede local).
-                                if self._dispositivo is None:
-                                    self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
-                                if self._tipo is None:
-                                    self._tipo = flat.get("eventType")
-                                if self._resumo is None:
-                                    self._resumo = resumir_campos(flat)
-                    else:
-                        ext = "jpg" if is_jpeg else ("png" if is_png else "bin")
-                        base = part["filename"] or f"{name}.{ext}"
-                        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{base}"
-                        fpath = os.path.join(SAVE_DIR, fname)
-                        with open(fpath, "wb") as f:
-                            f.write(data)
-                        if is_jpeg or is_png:
-                            self._imagens.append(fname)
-                        self._out(f"Campo '{name}': imagem salva em {fpath} ({len(data)} bytes)")
+                            # Se parecer XML, achata os campos e mostra como JSON
+                            # pra facilitar ver a estrutura do evento.
+                            if (part["filename"] or "").lower().endswith(".xml") or text.lstrip().startswith("<"):
+                                flat = flatten_xml(text)
+                                if flat:
+                                    self._out("Campos do evento (achatado, sem namespace):")
+                                    self._out(json.dumps(flat, indent=2, ensure_ascii=False))
+                                    self._out("")
+                                    # Identifica o dispositivo pelo IP/MAC de dentro do
+                                    # próprio XML — atrás de proxy/CDN, o IP da conexão
+                                    # TCP costuma ser o do proxy (ou o IP público
+                                    # compartilhado pelo roteador de todos os
+                                    # dispositivos da mesma rede local).
+                                    if self._dispositivo is None:
+                                        self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
+                                    if self._tipo is None:
+                                        self._tipo = flat.get("eventType")
+                                    if self._resumo is None:
+                                        self._resumo = resumir_campos(flat)
+                        else:
+                            ext = "jpg" if is_jpeg else ("png" if is_png else "bin")
+                            base = part["filename"] or f"{name}.{ext}"
+                            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{evento_id}_{base}"
+                            fpath = os.path.join(SAVE_DIR, fname)
+                            with open(fpath, "wb") as f:
+                                f.write(data)
+                            if is_jpeg or is_png:
+                                self._imagens.append(fname)
+                            self._out(f"Campo '{name}': imagem salva em {fpath} ({len(data)} bytes)")
         else:
             # Corpo simples (JSON, XML ou texto puro)
             try:
@@ -791,40 +847,50 @@ class EventHandler(BaseHTTPRequestHandler):
             self._out(text)
 
             ext = "xml" if text.lstrip().startswith("<") else ("json" if text.lstrip().startswith("{") else "txt")
-            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_corpo.{ext}"
-            with open(os.path.join(SAVE_DIR, fname), "w", encoding="utf-8") as f:
-                f.write(text)
-            self._textos.append(fname)
+            flat = flatten_xml(text) if ext == "xml" else {}
 
-            if ext == "xml":
-                flat = flatten_xml(text)
-                self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
-                self._tipo = flat.get("eventType")
-                self._resumo = resumir_campos(flat)
+            if evento_e_duplicado(flat.get("UUID")):
+                self._out(
+                    f"Evento duplicado descartado — mesmo UUID '{flat.get('UUID')}' de "
+                    f"um retry recente (não é uma nova detecção). Nada foi salvo nem "
+                    f"exibido na página."
+                )
+                self._descartado = True
+            else:
+                fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{evento_id}_corpo.{ext}"
+                with open(os.path.join(SAVE_DIR, fname), "w", encoding="utf-8") as f:
+                    f.write(text)
+                self._textos.append(fname)
 
-        if body:
-            with open(os.path.join(RAW_DIR, f"{evento_id}.raw"), "wb") as f:
-                f.write(body)
+                if ext == "xml":
+                    self._dispositivo = flat.get("ipAddress") or flat.get("macAddress")
+                    self._tipo = flat.get("eventType")
+                    self._resumo = resumir_campos(flat)
 
         duracao = time.monotonic() - inicio_processamento
         self._out(f"(processamento pós-ACK levou {duracao:.3f}s)")
         self._out("=" * 70 + "\n")
 
-        broadcast({
-            "id": evento_id,
-            "ts": ts,
-            "metodo": self.command,
-            "path": self.path,
-            "ip": self.client_address[0],
-            "dispositivo": self._dispositivo or self.client_address[0],
-            "tipo": self._tipo,
-            "resumo": self._resumo,
-            "content_type": content_type,
-            "tem_raw": bool(body),
-            "texto": "\n".join(self._lines),
-            "imagens": self._imagens,
-            "textos": self._textos,
-        })
+        if not self._descartado:
+            if body:
+                with open(os.path.join(RAW_DIR, f"{evento_id}.raw"), "wb") as f:
+                    f.write(body)
+
+            broadcast({
+                "id": evento_id,
+                "ts": ts,
+                "metodo": self.command,
+                "path": self.path,
+                "ip": self.client_address[0],
+                "dispositivo": self._dispositivo or self.client_address[0],
+                "tipo": self._tipo,
+                "resumo": self._resumo,
+                "content_type": content_type,
+                "tem_raw": bool(body),
+                "texto": "\n".join(self._lines),
+                "imagens": self._imagens,
+                "textos": self._textos,
+            })
 
     def do_POST(self):
         if self.path.startswith("/reenviar/"):
