@@ -12,9 +12,13 @@ de observação/depuração.
 
 Abrindo a URL raiz (`/`) do serviço num navegador, você vê os eventos
 chegando **ao vivo**, sem precisar dar refresh — não precisa entrar no
-dashboard do Render pra acompanhar. Configure o dispositivo pra mandar os
-eventos pra qualquer outro path (`/evento`, por exemplo) — `/`, `/stream` e
-`/events.json` são reservados para essa visualização.
+dashboard do Render pra acompanhar. Quando o dispositivo manda uma imagem
+(ex.: foto da placa/rosto capturados), a miniatura aparece direto no card do
+evento. Com vários dispositivos cadastrados no mesmo webhook, os eventos são
+agrupados por IP de origem — clique no "chip" de um dispositivo pra ver só
+os eventos dele. Configure o dispositivo pra mandar os eventos pra qualquer
+outro path (`/evento`, por exemplo) — `/`, `/stream`, `/events.json` e
+`/recebidos/*` são reservados para essa visualização.
 
 ## Rodando localmente
 
@@ -50,10 +54,13 @@ python event_listener.py 9000       # porta customizada
 
 ### Observações importantes
 
-- **Disco efêmero**: o Render reinicia o filesystem a cada deploy/restart. Os
-  arquivos salvos em `recebidos/` (imagens/XML) são perdidos nesse momento —
-  serve só pra depuração pontual, olhar os logs no dashboard do Render
-  enquanto testa cada dispositivo, não como armazenamento definitivo.
+- **Disco efêmero + limpeza automática**: o Render reinicia o filesystem a
+  cada deploy/restart, e os arquivos em `recebidos/` também são apagados
+  automaticamente em segundo plano (por padrão: mais de 6h de idade, ou o
+  quanto for preciso pra manter o total abaixo de 200 MB) — ajuste as
+  constantes `LIMPEZA_*` no topo do `event_listener.py` se quiser outros
+  limites. Serve só pra depuração pontual, não como armazenamento
+  definitivo.
 - **Plano Free "dorme"**: depois de ~15 min sem receber requisição, o Render
   suspende a instância; a próxima requisição demora alguns segundos (cold
   start) pra acordar o serviço. Pra observar eventos pontualmente (testando
@@ -62,3 +69,7 @@ python event_listener.py 9000       # porta customizada
   logado a tempo. Se isso incomodar, dá pra migrar depois pro plano Starter
   (pago, sem sleep) trocando `plan: free` por `plan: starter` no
   `render.yaml` ou no dashboard.
+- **Imagens sem autenticação**: `/recebidos/<arquivo>` serve qualquer imagem
+  salva pra quem souber (ou adivinhar) o nome do arquivo — não tem login.
+  Como o serviço e o repositório são públicos, evite usar isso com fotos que
+  não possam ficar temporariamente expostas por URL.

@@ -16,9 +16,9 @@ No dispositivo, configure em Configuration > Rede > Ligação de dados > ISAPI
 Listening (o caminho exato varia por modelo/firmware):
     IP/Domínio    : <IP/domínio deste servidor>
     Porta         : 8000  (ou a porta que você passar como argumento/PORT)
-    URL anfitrião : /evento   (qualquer path funciona, EXCETO "/", "/stream"
-                                e "/events.json", reservados para a página
-                                de visualização ao vivo abaixo)
+    URL anfitrião : /evento   (qualquer path funciona, EXCETO "/", "/stream",
+                                "/events.json" e "/recebidos/*", reservados
+                                para a página de visualização ao vivo abaixo)
 
 Todo POST/GET recebido é logado no terminal com headers e corpo. Quando o
 corpo é multipart/form-data, cada parte é salva em recebidos/: texto
@@ -29,7 +29,13 @@ estrutura do evento de cada tipo de dispositivo.
 
 Abrindo a URL raiz ("/") num navegador, você vê os eventos chegando ao vivo
 (via Server-Sent Events), sem precisar dar refresh — útil pra acompanhar o
-cadastro de cada dispositivo sem depender dos logs do Render.
+cadastro de cada dispositivo sem depender dos logs do Render. Os eventos são
+agrupados por IP de origem: clique num "chip" de dispositivo pra filtrar só
+os eventos dele.
+
+Os arquivos salvos em recebidos/ são apagados automaticamente (por idade e
+por tamanho total — veja LIMPEZA_* abaixo), pra não estourar o disco do
+plano Free do Render.
 """
 
 import sys
@@ -39,12 +45,65 @@ import json
 import queue
 import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+IMAGE_CONTENT_TYPES = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+}
+
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recebidos")
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Limpeza automática de recebidos/, pra não estourar o disco do plano Free
+# do Render: apaga o que passou da idade máxima e, se mesmo assim o total
+# ainda passar do tamanho máximo, apaga do arquivo mais antigo pro mais novo.
+LIMPEZA_INTERVALO_SEGUNDOS = 600
+LIMPEZA_IDADE_MAXIMA_SEGUNDOS = 6 * 3600
+LIMPEZA_TAMANHO_MAXIMO_BYTES = 200 * 1024 * 1024
+
+
+def limpar_recebidos():
+    agora = time.time()
+    try:
+        arquivos = []
+        for nome in os.listdir(SAVE_DIR):
+            caminho = os.path.join(SAVE_DIR, nome)
+            try:
+                stat = os.stat(caminho)
+            except OSError:
+                continue
+            if os.path.isfile(caminho):
+                arquivos.append((caminho, stat.st_mtime, stat.st_size))
+
+        restantes = []
+        for caminho, mtime, tamanho in arquivos:
+            if agora - mtime > LIMPEZA_IDADE_MAXIMA_SEGUNDOS:
+                os.remove(caminho)
+            else:
+                restantes.append((caminho, mtime, tamanho))
+
+        restantes.sort(key=lambda item: item[1])  # mais antigo primeiro
+        total = sum(tamanho for _, _, tamanho in restantes)
+        i = 0
+        while total > LIMPEZA_TAMANHO_MAXIMO_BYTES and i < len(restantes):
+            caminho, _, tamanho = restantes[i]
+            os.remove(caminho)
+            total -= tamanho
+            i += 1
+    except Exception as e:
+        print(f"Falha na limpeza de {SAVE_DIR}: {e}")
+
+
+def loop_limpeza():
+    while True:
+        limpar_recebidos()
+        time.sleep(LIMPEZA_INTERVALO_SEGUNDOS)
+
 
 # Buffer dos últimos eventos (pra quem abrir a página depois de eventos já
 # terem chegado) + assinantes conectados agora via SSE, pra ver ao vivo.
@@ -133,22 +192,33 @@ VIEWER_HTML = """<!doctype html>
   :root { color-scheme: dark; }
   body { margin:0; font-family: ui-monospace, Menlo, Consolas, monospace; background:#0b0f14; color:#d7e0ea; }
   header { position:sticky; top:0; background:#111820; padding:10px 16px; border-bottom:1px solid #24303c;
-           display:flex; align-items:center; gap:10px; z-index:1; }
+           z-index:1; }
+  .header-top { display:flex; align-items:center; gap:10px; }
   header h1 { font-size:14px; font-weight:600; margin:0; }
   #status { font-size:12px; padding:2px 8px; border-radius:10px; }
   #status.ok { background:#123d24; color:#5fd58a; }
   #status.down { background:#3d1212; color:#e37a7a; }
+  #dispositivos { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chip { font: inherit; font-size:12px; color:#a9bbcc; background:#182430; border:1px solid #24303c;
+          border-radius:999px; padding:4px 10px; cursor:pointer; }
+  .chip:hover { border-color:#3a4c60; }
+  .chip.ativo { background:#1b3550; border-color:#3f7dc9; color:#cfe3fb; }
   main { padding:12px 16px 40px; max-width:900px; margin:0 auto; }
   .evento { border:1px solid #24303c; border-radius:8px; padding:10px 12px; margin-bottom:10px; background:#0f151c; }
   .evento .meta { color:#7ea0c2; font-size:12px; margin-bottom:6px; }
   .evento pre { white-space: pre-wrap; word-break: break-word; margin:0; font-size:12.5px; line-height:1.4; }
+  .evento .imagens { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .evento .imagens img { max-width:220px; max-height:220px; border-radius:6px; border:1px solid #24303c; }
   #vazio { color:#5c6b7a; padding:20px 0; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Event Listener &mdash; ao vivo</h1>
-  <span id="status" class="down">conectando&hellip;</span>
+  <div class="header-top">
+    <h1>Event Listener &mdash; ao vivo</h1>
+    <span id="status" class="down">conectando&hellip;</span>
+  </div>
+  <div id="dispositivos"></div>
 </header>
 <main>
   <div id="vazio">Aguardando eventos&hellip;</div>
@@ -158,11 +228,52 @@ VIEWER_HTML = """<!doctype html>
   const log = document.getElementById('log');
   const vazio = document.getElementById('vazio');
   const status = document.getElementById('status');
+  const dispositivos = document.getElementById('dispositivos');
+
+  let filtro = null; // null = mostra todos; string = só esse IP
+  const contagem = {}; // ip -> quantidade de eventos vistos
+
+  function chipDoIp(ip) {
+    return dispositivos.querySelector(`[data-ip="${CSS.escape(ip)}"]`);
+  }
+
+  function selecionarFiltro(ip) {
+    filtro = (filtro === ip) ? null : ip;
+    dispositivos.querySelectorAll('.chip').forEach(btn => {
+      btn.classList.toggle('ativo', btn.dataset.ip === filtro);
+    });
+    todosBtn.classList.toggle('ativo', !filtro);
+    document.querySelectorAll('.evento').forEach(div => {
+      div.style.display = (!filtro || div.dataset.ip === filtro) ? '' : 'none';
+    });
+  }
+
+  const todosBtn = document.createElement('button');
+  todosBtn.className = 'chip ativo';
+  todosBtn.textContent = 'Todos';
+  todosBtn.onclick = () => selecionarFiltro(null);
+  dispositivos.appendChild(todosBtn);
+
+  function registrarDispositivo(ip) {
+    contagem[ip] = (contagem[ip] || 0) + 1;
+    let chip = chipDoIp(ip);
+    if (!chip) {
+      chip = document.createElement('button');
+      chip.className = 'chip';
+      chip.dataset.ip = ip;
+      chip.onclick = () => selecionarFiltro(ip);
+      dispositivos.appendChild(chip);
+    }
+    chip.textContent = `${ip} (${contagem[ip]})`;
+  }
 
   function addEvento(ev) {
     vazio.style.display = 'none';
+    registrarDispositivo(ev.ip);
     const div = document.createElement('div');
     div.className = 'evento';
+    div.dataset.ip = ev.ip;
+    if (filtro && ev.ip !== filtro) div.style.display = 'none';
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.textContent = `[${ev.ts}] ${ev.metodo} ${ev.path}  de ${ev.ip}`;
@@ -170,6 +281,22 @@ VIEWER_HTML = """<!doctype html>
     pre.textContent = ev.texto;
     div.appendChild(meta);
     div.appendChild(pre);
+    if (ev.imagens && ev.imagens.length) {
+      const imgs = document.createElement('div');
+      imgs.className = 'imagens';
+      for (const fname of ev.imagens) {
+        const a = document.createElement('a');
+        a.href = '/recebidos/' + encodeURIComponent(fname);
+        a.target = '_blank';
+        const img = document.createElement('img');
+        img.src = '/recebidos/' + encodeURIComponent(fname);
+        img.loading = 'lazy';
+        img.alt = fname;
+        a.appendChild(img);
+        imgs.appendChild(a);
+      }
+      div.appendChild(imgs);
+    }
     log.appendChild(div);
     window.scrollTo(0, document.body.scrollHeight);
   }
@@ -202,6 +329,24 @@ class EventHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(VIEWER_HTML)))
         self.end_headers()
         self.wfile.write(VIEWER_HTML)
+
+    def _serve_recebido(self):
+        fname = os.path.basename(urllib.parse.unquote(self.path[len("/recebidos/"):].split("?", 1)[0]))
+        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+        fpath = os.path.join(SAVE_DIR, fname)
+        if not fname or ext not in IMAGE_CONTENT_TYPES or not os.path.isfile(fpath):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        with open(fpath, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", IMAGE_CONTENT_TYPES[ext])
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_events_json(self):
         with STATE_LOCK:
@@ -268,6 +413,7 @@ class EventHandler(BaseHTTPRequestHandler):
 
     def _handle(self):
         self._lines = []
+        self._imagens = []
         ts = self._log_common()
         length = int(self.headers.get("Content-Length", 0))
         content_type = self.headers.get("Content-Type", "")
@@ -319,6 +465,8 @@ class EventHandler(BaseHTTPRequestHandler):
                         fpath = os.path.join(SAVE_DIR, fname)
                         with open(fpath, "wb") as f:
                             f.write(data)
+                        if is_jpeg or is_png:
+                            self._imagens.append(fname)
                         self._out(f"Campo '{name}': imagem salva em {fpath} ({len(data)} bytes)")
         else:
             # Corpo simples (JSON, XML ou texto puro)
@@ -338,6 +486,7 @@ class EventHandler(BaseHTTPRequestHandler):
             "path": self.path,
             "ip": self.client_address[0],
             "texto": "\n".join(self._lines),
+            "imagens": self._imagens,
         })
 
         # A Hikvision espera a resposta EXATA "HTTP/1.1 200 " (com espaço após o
@@ -357,6 +506,14 @@ class EventHandler(BaseHTTPRequestHandler):
             self._serve_stream()
         elif self.path.startswith("/events.json"):
             self._serve_events_json()
+        elif self.path.startswith("/recebidos/"):
+            self._serve_recebido()
+        elif self.path in ("/favicon.ico", "/robots.txt"):
+            # O navegador busca isso sozinho ao abrir "/" — responde sem
+            # logar/mostrar como se fosse um evento de dispositivo.
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         else:
             self._handle()
 
@@ -376,6 +533,7 @@ def main():
     # conexão aberta (SSE), então precisa de mais de uma thread pra não
     # travar o recebimento de eventos dos dispositivos enquanto isso.
     server = ThreadingHTTPServer(("0.0.0.0", port), EventHandler)
+    threading.Thread(target=loop_limpeza, daemon=True).start()
     print(f"Escutando em http://0.0.0.0:{port}  (Ctrl+C para parar)")
     print(f"Visualização ao vivo em: http://0.0.0.0:{port}/")
     print(f"Arquivos recebidos serão salvos em: {SAVE_DIR}")
