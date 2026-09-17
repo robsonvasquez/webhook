@@ -210,7 +210,13 @@ VIEWER_HTML = """<!doctype html>
   main { padding:12px 16px 40px; max-width:900px; margin:0 auto; }
   .evento { border:1px solid #24303c; border-left-width:4px; border-radius:8px; padding:10px 12px;
             margin-bottom:10px; background:#0f151c; }
-  .evento .meta { color:#7ea0c2; font-size:12px; margin-bottom:6px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .evento .meta { color:#7ea0c2; font-size:12px; margin-bottom:6px; display:flex; align-items:center; gap:8px;
+                   flex-wrap:wrap; cursor:pointer; user-select:none; }
+  .evento .meta:hover { color:#cfe3fb; }
+  .seta { display:inline-block; transition: transform 0.15s; flex:none; }
+  .evento.recolhido .seta { transform: rotate(-90deg); }
+  .evento.recolhido pre, .evento.recolhido .imagens { display:none; }
+  .evento.recolhido { padding-bottom:10px; }
   .badge-tipo { font-size:11px; font-weight:600; padding:1px 8px; border-radius:999px; color:#fff; }
   .evento pre { white-space: pre-wrap; word-break: break-word; margin:0; font-size:12.5px; line-height:1.4; }
   .evento .imagens { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
@@ -238,6 +244,7 @@ VIEWER_HTML = """<!doctype html>
 
   let filtro = null; // null = mostra todos; string = só esse dispositivo
   const contagem = {}; // dispositivo -> quantidade de eventos vistos
+  const ultimoPorDispositivo = {}; // dispositivo -> <div class="evento"> mais recente
 
   const CORES_TIPO = {
     ANPR: '#3f7dc9',
@@ -308,13 +315,24 @@ VIEWER_HTML = """<!doctype html>
     const deveRolar = pertoDoFim();
 
     const div = document.createElement('div');
-    div.className = 'evento';
+    div.className = 'evento'; // o mais recente de cada dispositivo começa aberto
     div.dataset.dispositivo = ev.dispositivo;
     div.style.borderLeftColor = corDoDispositivo(ev.dispositivo);
     if (filtro && ev.dispositivo !== filtro) div.style.display = 'none';
 
+    // Só fica aberto o último evento de cada dispositivo; ao chegar um novo,
+    // o anterior desse mesmo dispositivo recolhe sozinho.
+    const anterior = ultimoPorDispositivo[ev.dispositivo];
+    if (anterior) anterior.classList.add('recolhido');
+    ultimoPorDispositivo[ev.dispositivo] = div;
+
     const meta = document.createElement('div');
     meta.className = 'meta';
+    meta.onclick = () => div.classList.toggle('recolhido');
+    const seta = document.createElement('span');
+    seta.className = 'seta';
+    seta.textContent = '▾';
+    meta.appendChild(seta);
     if (ev.tipo) {
       const badge = document.createElement('span');
       badge.className = 'badge-tipo';

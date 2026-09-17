@@ -19,7 +19,10 @@ agrupados pelo IP interno de cada equipamento (lido de dentro do XML do
 evento — não do IP da conexão, que na Render é o mesmo pra todos os
 dispositivos atrás do mesmo roteador). Cada dispositivo e tipo de evento
 ganham uma cor; clique no "chip" de um dispositivo pra ver só os eventos
-dele. Configure o dispositivo pra mandar os eventos pra qualquer
+dele. Só o evento mais recente de cada dispositivo fica expandido — os
+anteriores ficam recolhidos automaticamente (clique no cabeçalho de
+qualquer evento pra expandir/recolher). Configure o dispositivo pra mandar
+os eventos pra qualquer
 outro path (`/evento`, por exemplo) — `/`, `/stream`, `/events.json` e
 `/recebidos/*` são reservados para essa visualização.
 
