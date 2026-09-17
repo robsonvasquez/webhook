@@ -13,6 +13,12 @@ Serve só para OBSERVAR o formato/conteúdo dos eventos ao cadastrar este
 servidor onde for preciso testar uma integração — não decide nada nem aciona
 nada de volta.
 
+O ACK ("HTTP/1.1 200 ", exigido pela Hikvision) é enviado assim que o corpo
+da requisição termina de chegar, ANTES de logar/gravar/processar qualquer
+coisa — dispositivos (ou proxies no caminho) costumam reenviar o mesmo
+evento por timeout se a resposta demorar, o que aparece como eventos
+"duplicados" que na real são retries do mesmo evento original.
+
 Uso:
     python event_listener.py [porta]
 
@@ -678,8 +684,7 @@ class EventHandler(BaseHTTPRequestHandler):
         print(text)
         self._lines.append(text)
 
-    def _log_common(self):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _log_common(self, ts):
         self._out("\n" + "=" * 70)
         self._out(f"[{ts}] {self.command} {self.path}  de {self.client_address[0]}")
         self._out("-" * 70)
@@ -687,7 +692,6 @@ class EventHandler(BaseHTTPRequestHandler):
         for k, v in self.headers.items():
             self._out(f"  {k}: {v}")
         self._out("-" * 70)
-        return ts
 
     def _handle(self):
         self._lines = []
@@ -697,10 +701,24 @@ class EventHandler(BaseHTTPRequestHandler):
         self._tipo = None
         self._resumo = None
         evento_id = uuid.uuid4().hex[:10]
-        ts = self._log_common()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         length = int(self.headers.get("Content-Length", 0))
         content_type = self.headers.get("Content-Type", "")
         body = self.rfile.read(length) if length > 0 else b""
+
+        # Responde o ACK aqui, ANTES de logar/gravar/processar o que veio no
+        # corpo. A Hikvision espera a resposta EXATA "HTTP/1.1 200 " (com
+        # espaço após o 200, sem "OK") rapidamente — se o processamento
+        # (gravar imagens grandes em disco, por exemplo) demorar antes de
+        # responder, a câmera ou um proxy no caminho pode reenviar a mesma
+        # requisição por timeout, o que aparece como eventos "duplicados"
+        # que na real são apenas retries do mesmo evento original.
+        self.send_response_only(200, "")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+        inicio_processamento = time.monotonic()
+        self._log_common(ts)
 
         if length == 0:
             self._out("(sem corpo)")
@@ -784,11 +802,13 @@ class EventHandler(BaseHTTPRequestHandler):
                 self._tipo = flat.get("eventType")
                 self._resumo = resumir_campos(flat)
 
-        self._out("=" * 70 + "\n")
-
         if body:
             with open(os.path.join(RAW_DIR, f"{evento_id}.raw"), "wb") as f:
                 f.write(body)
+
+        duracao = time.monotonic() - inicio_processamento
+        self._out(f"(processamento pós-ACK levou {duracao:.3f}s)")
+        self._out("=" * 70 + "\n")
 
         broadcast({
             "id": evento_id,
@@ -805,13 +825,6 @@ class EventHandler(BaseHTTPRequestHandler):
             "imagens": self._imagens,
             "textos": self._textos,
         })
-
-        # A Hikvision espera a resposta EXATA "HTTP/1.1 200 " (com espaço após o
-        # 200, sem "OK"). Sem isso, alguns firmwares reenviam o mesmo evento
-        # repetidamente por não reconhecerem a confirmação de recebimento.
-        self.send_response_only(200, "")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
 
     def do_POST(self):
         if self.path.startswith("/reenviar/"):

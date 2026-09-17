@@ -16,6 +16,13 @@ tipo de payload, o corpo cru continua sendo logado normalmente.
 Não decide nada nem aciona nada de volta no dispositivo: é só um listener
 de observação/depuração.
 
+**Eventos "duplicados" na câmera?** O ACK (`HTTP/1.1 200 `, no formato exato
+que a Hikvision exige) é enviado assim que o corpo termina de chegar, antes
+de gravar qualquer arquivo em disco — se a resposta demora, a própria câmera
+(ou um proxy no meio do caminho) tende a reenviar a mesma captura por
+timeout, o que aparece como dois eventos idênticos (mesmo `UUID`/
+`activePostCount` no XML) em vez de dois eventos novos.
+
 Abrindo a URL raiz (`/`) do serviço num navegador, você vê os eventos
 chegando **ao vivo**, sem precisar dar refresh. Quando o dispositivo manda
 uma imagem (ex.: foto da placa/rosto capturados), a miniatura aparece direto
